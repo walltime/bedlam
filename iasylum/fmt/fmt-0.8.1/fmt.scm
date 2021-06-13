@@ -176,6 +176,9 @@
 (define (fmt st . args)
   (fmt-start st new-fmt-state (apply-cat args)))
 
+(define (fmt/s . args)
+  (apply fmt (cons #f args)))
+
 (define (fmt-update str st)
   (let ((len (string-length str))
         (nli (string-index-right str #\newline))
@@ -289,12 +292,12 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; standard formatters
 
-(define (nl st)
+(define (fmt-nl st)
   ((fmt-writer st) nl-str st))
 
 ;; output a newline iff we're not at the start of a fresh line
 (define (fl st)
-  (if (zero? (fmt-col st)) st (nl st)))
+  (if (zero? (fmt-col st)) st (fmt-nl st)))
 
 ;; tab to a given tab-stop
 (define (tab-to . o)

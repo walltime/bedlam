@@ -8,7 +8,7 @@
             (clj
              (string-append "
               (let [ result-var (conversations/list {:api-url \"https://slack.com/api\" :token " token-var "}
-                                  {:exclude_members \"true\" :cursor " cursor-var " :limit \"300\"
+                                  {:exclude_members \"true\" :cursor " cursor-var " :limit \"800\"
                                                  :types \"public_channel,private_channel,mpim,im\"
                                   }) ]
                 (list (map (fn [channel] {(get channel :id) (get channel :name)}) (get result-var :channels))
@@ -24,7 +24,9 @@
            `((the-fetched-clojure-list ,the-fetched-clojure-list)
              (next-or-empty
               ,(if (string=? next-cursor "") (clj "[]")
-                   (loop next-cursor))))))))
+                   (begin
+                     (sleep-seconds 6)
+                     (loop next-cursor)))))))))
 
 (define slack/create-reader-bot
     (lambda* ((name: name) (channels: channels) (token: token) (fetch-bots-messages: fetch-bots-messages))
@@ -291,6 +293,10 @@
 
 (define irc/create-bot-on-channel (lambda p (nyi)))
 
+(define (split-spaces str)
+ ;; Handles unicode nbsp chars as well as regular spaces.
+  (irregex-split (irregex `(+ (or "\u00a0" " "))) str))
+
 (define* (bot/add-global-commands (token: token #f) bot commands)
   (match-lambda*
    [('read-attributed-line-struct)
@@ -300,25 +306,25 @@
       (for-each (match-lambda ([command fn]
                           (log-trace "command:" command "what-was-read:" what-was-read)
                           (if (string-prefix? command what-was-read)
-                              (let ((params (cdr (split-string " " what-was-read))))
+                              (let ((params (cdr (split-spaces what-was-read))))
                                 (log-trace "bot:" bot "params:" params)
                                 (fn bot params))))
                          (['id: id command fn]
                           (log-trace "command:" command "what-was-read:" what-was-read)
                           (if (string-prefix? command what-was-read)
-                              (let ((params (cdr (split-string " " what-was-read))))
+                              (let ((params (cdr (split-spaces what-was-read))))
                                 (log-trace "bot:" bot "params:" params)
                                 (fn 'id: id bot params))))
                          (['id: id command fn ':attributed:]
                           (log-trace "command:" command "what-was-read:" what-was-read)
                           (if (string-prefix? command what-was-read)
-                              (let ((params (cdr (split-string " " what-was-read))))
+                              (let ((params (cdr (split-spaces what-was-read))))
                                 (log-trace "bot:" bot "params:" params)
                                 (fn 'id: id 'sender: sender bot params))))
                          (['id: id command fn ':attributed-email:]
                           (log-trace "command:" command "what-was-read:" what-was-read)
                           (if (string-prefix? command what-was-read)
-                              (let ((params (cdr (split-string " " what-was-read))))
+                              (let ((params (cdr (split-spaces what-was-read))))
                                 (log-trace "bot:" bot "params:" params)
                                 (let ((sender-email (and sender token
                                                          (slack-user-info/fetch-email
@@ -328,13 +334,13 @@
                          ([command ':no-params: fn]
                           (log-trace "command:" command "what-was-read:" what-was-read)
                           (if (string-prefix? command what-was-read)
-                              (let ((params (cdr (split-string " " what-was-read))))
+                              (let ((params (cdr (split-spaces what-was-read))))
                                 (log-trace "bot:" bot "params:" params)
                                 (fn bot))))
                          (['id: id command ':no-params: fn]
                           (log-trace "command:" command "what-was-read:" what-was-read)
                           (if (string-prefix? command what-was-read)
-                              (let ((params (cdr (split-string " " what-was-read))))
+                              (let ((params (cdr (split-spaces what-was-read))))
                                 (log-trace "bot:" bot "params:" params)
                                 (fn 'id: id bot))))
                          ([command ':one-param: fn]
@@ -349,10 +355,36 @@
                               (let ((param (string-drop  what-was-read (string-length command))))
                                 (log-trace "bot:" bot "param:" param)
                                 (fn 'id: id bot param))))
+                         (['id: id command ':one-param: fn ':attributed:]
+                          (log-trace "command:" command "what-was-read:" what-was-read)
+                          (if (string-prefix? command what-was-read)
+                              (let ((param (string-drop  what-was-read (string-length command))))
+                                (log-trace "bot:" bot "param:" param)
+                                (fn 'id: id 'sender: sender bot param))))
+                         (['id: id command ':one-param: fn ':attributed-email:]
+                          (log-trace "command:" command "what-was-read:" what-was-read)
+                          (if (string-prefix? command what-was-read)
+                              (let ((param (string-drop  what-was-read (string-length command))))
+                                (log-trace "bot:" bot "param:" param)
+                                (let ((sender-email (and sender token
+                                                         (slack-user-info/fetch-email
+                                                          (slack/fetch-user-info 'user-id: sender 'token: token
+                                                                                 'timeout-milliseconds: 600000)))))
+                                  (fn 'id: id 'sender-email: sender-email bot param)))))
                           )
                 commands)
       m-struct)]
    [(anything-else . params) (apply bot (cons anything-else params))]))
+
+;;; WATCHDOG support.
+
+(define bot/watch-dog-maximum-allowed-pulseless-period-seconds (make-parameter* 375))
+
+(define bot/watchdog-recent-pulse-happened (make-expiring-parameter* 'expiration-seconds: (bot/watch-dog-maximum-allowed-pulseless-period-seconds)))
+
+(define (bot/watchdog-assuage)
+  (log-trace "bot/watchdog-assuage called.")
+  (bot/watchdog-recent-pulse-happened #t))
 
 (define* (bot/add-global-help-and-exit-commands bot help-text (exit-thunk: exit-thunk (lambda () (j "System.exit(0);"))))
   (let ((new-bot
@@ -360,8 +392,55 @@
                                                 (bot 'd (string-append*
                                                          "\n```"
                                                          (add-between "\n" help-text "```")))))
-                                    ("/exit" ,(lambda (bot params)
-                                                (bot 'd/n "Will exit in 3 seconds.")
-                                                (sleep-seconds 3)
-                                                (exit-thunk)))))))
+                                        ("/bot-pulse" ,(lambda (bot params)
+                                                     (bot/watchdog-assuage)
+                                                     (bot 'd (string-append* "Up @ "
+                                                                             (iso-8601-timestamp)))))
+                                        ("/exit" ,(lambda (bot params)
+                                                    (bot 'd/n "Will exit in 3 seconds.")
+                                                    (sleep-seconds 3)
+                                                    (exit-thunk)))))))
     new-bot))
+
+
+;; WATCHDOG
+
+(define bot/suppress-watchdog? (make-parameter* (get-env "SUPPRESS_WATCHDOG")))
+
+;; Monitor slack-based access health. Guarantees access to channels where this runs. Shutdown if any issues are found.
+(define* (bot/enable-watchdog (failure-callback: failure-callback (lambda ignored #t))
+                              (channel-name: channel-name)
+                              (slack-token: slack-token)
+                              (pulse-command: pulse-command))
+  (define assuager-cycle-seconds (* (bot/watch-dog-maximum-allowed-pulseless-period-seconds) 4/5))
+
+  (bot/watchdog-assuage) ;; Avoids immediate triggering during startup.
+
+  (thread/spawn* 'thread-name: "watchdog"
+                 (lambda () (let loop ()
+                         (sleep-seconds 16)
+                         (when (bot/suppress-watchdog?) (loop))
+                         (if (bot/watchdog-recent-pulse-happened)
+                             (begin
+                               (log-trace "watchdog checked. everything ok.")
+                               (loop))
+                             (begin
+                               (thread/spawn (lambda ()
+                                               (log-error "watchdog triggered. shutting down.")
+                                               (failure-callback "watchdog triggered. shutting down.")))
+                               (sleep-seconds 5)
+                               (panic))))))
+
+  (thread/spawn* 'thread-name: "bot/watchdog-assuager"
+                 (lambda ()
+                   (define pulse-bot-queue (make-queue))
+
+                   (slack/work-queue-bot 'in-work-queue: pulse-bot-queue
+                                         'name: "bot/watchdog-assuager"
+                                         'channel: channel-name
+                                         'token: slack-token)
+                   (sleep-seconds 4)
+                   (let loop ()
+                        (pulse-bot-queue 'put pulse-command)
+                        (sleep-seconds assuager-cycle-seconds)
+                        (loop)))))
